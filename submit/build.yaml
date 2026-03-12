@@ -1,1 +1,214 @@
-# cloudformation solution goes here
+AWSTemplateFormatVersion: '2010-09-09'
+Description: DP1 Anomaly Detection full stack (EC2, S3, SNS, IAM, networking)
+
+Parameters:
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Name of an existing EC2 KeyPair to enable SSH access
+
+  ClientIpCidr:
+    Type: String
+    Description: Your public IP in CIDR form for SSH, e.g. 1.2.3.4/32
+
+  RepoUrl:
+    Type: String
+    Description: Git URL of your forked anomaly-detection repository
+
+  UbuntuAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Description: Latest Ubuntu 24.04 LTS AMI ID from SSM public parameters
+    Default: /aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id
+
+Resources:
+  AnomalySnsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: ds5220-dp1
+
+  AnomalySnsTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref AnomalySnsTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowS3ToPublish
+            Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref AnomalySnsTopic
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+
+  AnomalyBucket:
+    Type: AWS::S3::Bucket
+    DependsOn:
+      - AnomalySnsTopicPolicy
+    Properties:
+      NotificationConfiguration:
+        TopicConfigurations:
+          - Event: s3:ObjectCreated:*
+            Topic: !Ref AnomalySnsTopic
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: raw/
+                  - Name: suffix
+                    Value: .csv
+
+  AnomalyInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: AnomalyBucketAccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: BucketListAccess
+                Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource: !GetAtt AnomalyBucket.Arn
+              - Sid: BucketObjectAccess
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:AbortMultipartUpload
+                  - s3:ListBucketMultipartUploads
+                  - s3:ListMultipartUploadParts
+                Resource: !Sub '${AnomalyBucket.Arn}/*'
+
+  AnomalyInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles:
+        - !Ref AnomalyInstanceRole
+
+  AnomalySecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for anomaly detection API instance
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref ClientIpCidr
+        - IpProtocol: tcp
+          FromPort: 8000
+          ToPort: 8000
+          CidrIp: 0.0.0.0/0
+
+  AnomalyInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref UbuntuAmiId
+      InstanceType: t3.micro
+      KeyName: !Ref KeyName
+      IamInstanceProfile: !Ref AnomalyInstanceProfile
+      SecurityGroupIds:
+        - !Ref AnomalySecurityGroup
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: 16
+            VolumeType: gp3
+            DeleteOnTermination: true
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -xe
+          apt-get update -y
+          apt-get install -y python3 python3-venv python3-pip git
+
+          APP_DIR=/home/ubuntu/anomaly-detection
+          mkdir -p $APP_DIR
+          chown -R ubuntu:ubuntu /home/ubuntu
+
+          if [ ! -d "$APP_DIR/.git" ]; then
+            sudo -u ubuntu git clone ${RepoUrl} $APP_DIR
+          fi
+
+          cd $APP_DIR
+
+          sudo -u ubuntu python3 -m venv venv
+          sudo -u ubuntu bash -lc "cd $APP_DIR && source venv/bin/activate && pip install --upgrade pip && pip install -r requirements.txt"
+
+          export BUCKET_NAME='${AnomalyBucket}'
+          grep -q '^BUCKET_NAME=' /etc/environment && \
+            sed -i "s|^BUCKET_NAME=.*|BUCKET_NAME='${AnomalyBucket}'|" /etc/environment || \
+            echo "BUCKET_NAME='${AnomalyBucket}'" >> /etc/environment
+
+          cat >/etc/systemd/system/anomaly-api.service <<EOF
+          [Unit]
+          Description=Anomaly Detection FastAPI Service
+          After=network.target
+
+          [Service]
+          User=ubuntu
+          WorkingDirectory=$APP_DIR
+          Environment=BUCKET_NAME=${AnomalyBucket}
+          EnvironmentFile=/etc/environment
+          ExecStart=$APP_DIR/venv/bin/fastapi run $APP_DIR/app.py --host 0.0.0.0 --port 8000
+          Restart=always
+          RestartSec=5
+
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+
+          systemctl daemon-reload
+          systemctl enable anomaly-api.service
+          systemctl start anomaly-api.service
+
+  AnomalyEip:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+
+  AnomalyEipAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      InstanceId: !Ref AnomalyInstance
+      AllocationId: !GetAtt AnomalyEip.AllocationId
+
+  AnomalySnsSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref AnomalySnsTopic
+      Protocol: http
+      Endpoint: !Sub 'http://${AnomalyEip.PublicIp}:8000/notify'
+
+Outputs:
+  InstanceId:
+    Description: EC2 instance ID
+    Value: !Ref AnomalyInstance
+
+  InstancePublicIp:
+    Description: Elastic IP address attached to the instance
+    Value: !Ref AnomalyEip
+
+  BucketName:
+    Description: S3 bucket name used by the application
+    Value: !Ref AnomalyBucket
+
+  SnsTopicArn:
+    Description: SNS topic ARN for ds5220-dp1
+    Value: !Ref AnomalySnsTopic
+
+  ApiEndpoint:
+    Description: Base HTTP endpoint for the FastAPI service
+    Value: !Sub 'http://${AnomalyEip.PublicIp}:8000'
